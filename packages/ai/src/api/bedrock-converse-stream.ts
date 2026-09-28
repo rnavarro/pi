@@ -933,11 +933,16 @@ function sanitizeBedrockDocument(value: JsonValue): DocumentType {
 	return value;
 }
 
-function convertToolResultContent(content: (TextContent | ImageContent)[]): ToolResultContentBlock[] {
+function convertToolResultContent(
+	content: (TextContent | ImageContent)[],
+	siblingImages?: ContentBlock.ImageMember[],
+): ToolResultContentBlock[] {
 	const result: ToolResultContentBlock[] = [];
 	for (const c of content) {
 		if (c.type === "image") {
-			result.push({ image: createImageBlock(c.mimeType, c.data) });
+			const image = { image: createImageBlock(c.mimeType, c.data) };
+			if (siblingImages) siblingImages.push(image);
+			else result.push(image);
 		} else {
 			const textBlock = createNonBlankTextBlock(c.text);
 			if (textBlock) result.push(textBlock);
@@ -1065,6 +1070,14 @@ function convertMessages(
 				break;
 			}
 			case "toolResult": {
+				// Bedrock's OpenAI models accept tool images beside tool results in the
+				// user message, but reject images nested inside toolResult.content.
+				// Application inference profile ARNs may hide the underlying model ID.
+				const siblingImages: ContentBlock.ImageMember[] = [];
+				const hoistImages = getModelMatchCandidates(model.id, model.name).some(
+					(candidate) =>
+						/(?:^|[./])openai[./-]/.test(candidate) || /(?:^|[^a-z])gpt-(?:5[.-]6|6)(?:[^0-9]|$)/.test(candidate),
+				);
 				// Collect all consecutive toolResult messages into a single user message
 				// Bedrock requires all tool results to be in one message
 				const toolResults: ContentBlock.ToolResultMember[] = [];
@@ -1073,7 +1086,7 @@ function convertMessages(
 				toolResults.push({
 					toolResult: {
 						toolUseId: m.toolCallId,
-						content: convertToolResultContent(m.content),
+						content: convertToolResultContent(m.content, hoistImages ? siblingImages : undefined),
 						status: m.isError ? ToolResultStatus.ERROR : ToolResultStatus.SUCCESS,
 					},
 				});
@@ -1085,7 +1098,7 @@ function convertMessages(
 					toolResults.push({
 						toolResult: {
 							toolUseId: nextMsg.toolCallId,
-							content: convertToolResultContent(nextMsg.content),
+							content: convertToolResultContent(nextMsg.content, hoistImages ? siblingImages : undefined),
 							status: nextMsg.isError ? ToolResultStatus.ERROR : ToolResultStatus.SUCCESS,
 						},
 					});
@@ -1095,7 +1108,7 @@ function convertMessages(
 				// Skip the messages we've already processed
 				i = j - 1;
 
-				result.push({ role: ConversationRole.USER, content: toolResults });
+				result.push({ role: ConversationRole.USER, content: [...toolResults, ...siblingImages] });
 				break;
 			}
 			default:

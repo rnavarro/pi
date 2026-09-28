@@ -174,6 +174,86 @@ describe("Bedrock tool arguments", () => {
 	});
 });
 
+// Regression for #8643: GPT models on Bedrock reject images inside toolResult.content.
+describe("Bedrock tool-result images", () => {
+	const firstImage = { type: "image" as const, mimeType: "image/png", data: "AQID" };
+	const secondImage = { type: "image" as const, mimeType: "image/png", data: "BAUG" };
+	const messages: Message[] = [
+		{
+			role: "toolResult",
+			toolCallId: "read-1",
+			toolName: "read",
+			content: [{ type: "text", text: "first image" }, firstImage],
+			isError: false,
+			timestamp: 1,
+		},
+		{
+			role: "toolResult",
+			toolCallId: "read-2",
+			toolName: "read",
+			content: [secondImage],
+			isError: true,
+			timestamp: 2,
+		},
+	];
+
+	it.each([
+		{ id: "global.openai.gpt-6-sol", name: "GPT-6 Sol (Global)" },
+		{ id: "us.openai.gpt-6-luna", name: "GPT-6 Luna (US)" },
+		{ id: "arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-6-sol-v1:0", name: "GPT-6 Sol" },
+		{ id: "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/example", name: "GPT-6 Sol (App)" },
+	])("hoists images after grouped tool results for $id", async ({ id, name }) => {
+		const model = { ...baseModel, id, name };
+		const payload = (await capturePayload({ messages }, model)) as {
+			messages: Array<{ role: string; content: Array<Record<string, unknown>> }>;
+		};
+		const content = payload.messages[0].content;
+		expect(payload.messages).toHaveLength(1);
+		expect(content).toEqual([
+			{ toolResult: { toolUseId: "read-1", content: [{ text: "first image" }], status: "success" } },
+			{ toolResult: { toolUseId: "read-2", content: [{ text: "<empty>" }], status: "error" } },
+			{ image: { format: "png", source: { bytes: Uint8Array.from([1, 2, 3]) } } },
+			{ image: { format: "png", source: { bytes: Uint8Array.from([4, 5, 6]) } } },
+		]);
+		expect(messages[0].content).toEqual([{ type: "text", text: "first image" }, firstImage]);
+	});
+
+	it("keeps Claude tool-result images nested", async () => {
+		const payload = (await capturePayload({ messages }, baseModel)) as {
+			messages: Array<{ content: Array<Record<string, unknown>> }>;
+		};
+		const content = payload.messages[0].content;
+		expect(content).toHaveLength(2);
+		expect(content[0]).toEqual({
+			toolResult: {
+				toolUseId: "read-1",
+				content: [
+					{ text: "first image" },
+					{ image: { format: "png", source: { bytes: Uint8Array.from([1, 2, 3]) } } },
+				],
+				status: "success",
+			},
+		});
+		expect(content[1]).toEqual({
+			toolResult: {
+				toolUseId: "read-2",
+				content: [{ image: { format: "png", source: { bytes: Uint8Array.from([4, 5, 6]) } } }],
+				status: "error",
+			},
+		});
+	});
+
+	it("keeps directly attached user images in user content", async () => {
+		const payload = (await capturePayload(
+			{ messages: [{ role: "user", content: [firstImage], timestamp: 1 }] },
+			{ ...baseModel, id: "global.openai.gpt-6-sol" },
+		)) as { messages: Array<{ content: unknown[] }> };
+		expect(payload.messages[0].content).toEqual([
+			{ image: { format: "png", source: { bytes: Uint8Array.from([1, 2, 3]) } } },
+		]);
+	});
+});
+
 describe("bedrock convertMessages skips unknown content types", () => {
 	it("skips unknown user content blocks instead of throwing", async () => {
 		const messages: Message[] = [
