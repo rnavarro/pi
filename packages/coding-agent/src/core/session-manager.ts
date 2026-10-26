@@ -1004,10 +1004,15 @@ export class SessionManager {
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
 		preloadedFileEntries?: FileEntry[],
+		shareIndexFrom?: SessionManager,
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
+		if (shareIndexFrom) {
+			this._adoptSharedSession(shareIndexFrom);
+			return;
+		}
 		if (persist && this.sessionDir && !existsSync(this.sessionDir)) {
 			mkdirSync(this.sessionDir, { recursive: true });
 		}
@@ -1024,6 +1029,34 @@ export class SessionManager {
 	/** Switch to a different session file (used for resume and branching) */
 	setSessionFile(sessionFile: string): void {
 		this._setSessionFile(sessionFile);
+	}
+
+	/**
+	 * A throwaway manager over the same entries, for previewing drafts.
+	 *
+	 * Building one by re-loading entries re-indexes the whole session (three maps,
+	 * one entry at a time) and re-walks the branch, which on a long session costs
+	 * milliseconds per call — and the boundary preview builds one on every turn-end
+	 * emission. Entries are immutable and append-only, so the parent's index can be
+	 * adopted by copying the maps; appends on the preview land in its own copy.
+	 *
+	 * The preview's index covers every entry the parent holds, not just the current
+	 * branch: the projection follows parents from the leaf, so off-path entries
+	 * cannot change it, and a draft that targets an off-path id can now be applied
+	 * instead of being silently skipped.
+	 */
+	static preview(parent: SessionManager, cwd?: string): SessionManager {
+		return new SessionManager(cwd ?? parent.cwd, "", undefined, false, undefined, undefined, parent);
+	}
+
+	private _adoptSharedSession(parent: SessionManager): void {
+		this.sessionId = parent.sessionId;
+		this.flushed = parent.flushed;
+		this.fileEntries = parent.fileEntries.slice();
+		this.byId = new Map(parent.byId);
+		this.labelsById = new Map(parent.labelsById);
+		this.labelTimestampsById = new Map(parent.labelTimestampsById);
+		this.leafId = parent.leafId;
 	}
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {

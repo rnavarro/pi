@@ -985,9 +985,8 @@ export class AgentSession {
 	}
 
 	private _createBoundaryPreviewManager(drafts: SessionBoundaryDraft[]): SessionManager {
-		const header = this.sessionManager.getHeader();
-		if (!header) throw new Error("Session header is missing");
-		const manager = SessionManager.inMemory(this._cwd, undefined, [header, ...this.sessionManager.getBranch()]);
+		if (!this.sessionManager.getHeader()) throw new Error("Session header is missing");
+		const manager = SessionManager.preview(this.sessionManager, this._cwd);
 		this._applyBoundaryDrafts(manager, drafts);
 		return manager;
 	}
