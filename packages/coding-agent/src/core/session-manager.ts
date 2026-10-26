@@ -478,7 +478,18 @@ export function buildContextEntries(
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
 ): SessionEntry[] {
-	const path = buildSessionPath(entries, leafId, byId);
+	return contextEntriesFromPath(buildSessionPath(entries, leafId, byId));
+}
+
+/**
+ * The compaction-aware context for an already-walked path.
+ *
+ * `buildSessionPath` walks the whole ancestry, and several callers need the path
+ * *and* the context it produces. Splitting the trim out lets them walk once
+ * instead of twice: on a long session the ancestry is the entire history (tens
+ * of thousands of entries), while the context after compaction is a few hundred.
+ */
+export function contextEntriesFromPath(path: SessionEntry[]): SessionEntry[] {
 	let compaction: CompactionEntry | null = null;
 
 	for (const entry of path) {
@@ -545,9 +556,20 @@ export function buildSessionProjection(
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
 ): SessionProjection {
-	const path = buildSessionPath(entries, leafId, byId);
+	return buildSessionProjectionFromPath(buildSessionPath(entries, leafId, byId));
+}
+
+/**
+ * Build the projection for an already-walked path.
+ *
+ * Callers that hold the path (the session manager walks it from its own index)
+ * pass it here so the ancestry is traversed once per projection rather than
+ * twice. `buildContextEntries` used to re-walk the same entries the caller had
+ * just walked, which on a long session doubled the most expensive part.
+ */
+export function buildSessionProjectionFromPath(path: SessionEntry[]): SessionProjection {
 	const { thinkingLevel, model } = getSessionContextSettings(path);
-	const contextEntries = buildContextEntries(entries, leafId, byId);
+	const contextEntries = contextEntriesFromPath(path);
 	const edits = new Map<string, ContextEditEntry>();
 	for (const entry of contextEntries) {
 		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
@@ -996,6 +1018,17 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	/**
+	 * Last projection built for this manager, keyed on the two things that can
+	 * change it: entry count and leaf. The session is append-only with immutable
+	 * entries, so those two values identify a projection exactly; both are
+	 * cleared in `_appendEntry` and `_buildIndex` rather than trusted alone.
+	 *
+	 * Rebuilding one is O(entire ancestry) — a long session's path is its whole
+	 * history even after compaction shrinks the context to a few hundred entries —
+	 * and callers ask for it repeatedly per turn (the footer asks once per append).
+	 */
+	private projectionCache: { entryCount: number; leafId: string | null; projection: SessionProjection } | undefined;
 
 	private constructor(
 		cwd: string,
@@ -1073,6 +1106,7 @@ export class SessionManager {
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
+		this.projectionCache = undefined;
 		this.flushed = false;
 
 		if (this.persist) {
@@ -1104,6 +1138,7 @@ export class SessionManager {
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
+		this.projectionCache = undefined;
 		this.leafId = null;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
@@ -1192,6 +1227,7 @@ export class SessionManager {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
+		this.projectionCache = undefined;
 		this._persist(entry);
 	}
 
@@ -1488,10 +1524,19 @@ export class SessionManager {
 
 	/**
 	 * Build the session context (what gets sent to the LLM).
-	 * Uses tree traversal from current leaf.
+	 * Uses tree traversal from current leaf, walked from the index rather than
+	 * from a copy of every entry, and memoised until an append or branch changes
+	 * the leaf.
 	 */
 	buildSessionProjection(): SessionProjection {
-		return buildSessionProjection(this.getEntries(), this.leafId, this.byId);
+		const entryCount = this.byId.size;
+		const cached = this.projectionCache;
+		if (cached && cached.entryCount === entryCount && cached.leafId === this.leafId) {
+			return cached.projection;
+		}
+		const projection = buildSessionProjectionFromPath(this.getBranch());
+		this.projectionCache = { entryCount, leafId: this.leafId, projection };
+		return projection;
 	}
 
 	buildSessionContext(): SessionContext {
